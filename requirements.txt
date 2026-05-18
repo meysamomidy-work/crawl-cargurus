@@ -1,0 +1,9 @@
+beautifulsoup4>=4.12
+curl-cffi>=0.7
+geopandas>=0.14
+numpy>=1.24
+openpyxl>=3.1
+pandas>=2.0
+requests>=2.31
+shapely>=2.0
+xlsxwriter>=3.1

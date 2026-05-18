@@ -2,6 +2,7 @@ import csv
 import logging
 import os
 import random
+import sys
 import time
 from typing import Any
 
@@ -149,11 +150,27 @@ def _url_for_log(url: str, *, head: int = 72, tail: int = 56) -> str:
     return f"{url[:head]}...{url[-tail:]}"
 
 
-def inspect_http_response(response: requests.Response, label: str, url_short: str) -> None:
+def _response_body_len(response: Any) -> int:
+    text = getattr(response, "text", None)
+    if text:
+        return len(text)
+    content = getattr(response, "content", None)
+    return len(content) if content else 0
+
+
+def _response_text(response: Any) -> str:
+    text = getattr(response, "text", None)
+    if text:
+        return text
+    content = getattr(response, "content", None)
+    return (content or b"").decode("utf-8", errors="replace")
+
+
+def inspect_http_response(response: Any, label: str, url_short: str) -> None:
     """Log status, size, and soft signals of blocking (for docker logs)."""
     code = response.status_code
     _record_http_status(code)
-    text = response.text or ""
+    text = _response_text(response)
     n = len(text)
     hints = _html_block_hints(text)
     if hints:
@@ -235,17 +252,20 @@ def log_stats_snapshot(reason: str) -> None:
 class CargurusClient:
     """
     One session + cookie jar for the whole crawl (Compute Engine / GCP friendly).
-    Optional curl_cffi uses Chrome TLS/JA3 impersonation — often fixes 406 from datacenters.
+    curl_cffi Chrome TLS/JA3 impersonation is the default — required for most GCP egress.
     """
 
     def __init__(self) -> None:
         self._kind: str
         self.session: Any
+        self._impersonate: str | None = None
         self._warmed = False
-        self._kind, self.session = self._open_session()
+        self._kind, self.session, self._impersonate = self._open_session()
 
-    def _open_session(self) -> tuple[str, Any]:
-        if _env_bool("CRAWL_USE_CURL_CFFI", True):
+    def _open_session(self) -> tuple[str, Any, str | None]:
+        use_cffi = _env_bool("CRAWL_USE_CURL_CFFI", True)
+        require_cffi = _env_bool("CRAWL_REQUIRE_CURL_CFFI", True)
+        if use_cffi:
             try:
                 from curl_cffi import requests as cfr
 
@@ -261,23 +281,39 @@ class CargurusClient:
                     )
                     s = cfr.Session(impersonate="chrome120")
                     used_imp = "chrome120"
-                log.info("HTTP client: curl_cffi impersonate=%s (good for GCP egress)", used_imp)
-                return "cffi", s
+                log.info("HTTP client: curl_cffi impersonate=%s (required on GCP)", used_imp)
+                return "cffi", s, used_imp
+            except ImportError as ex:
+                if require_cffi:
+                    log.error(
+                        "curl_cffi is required for CarGurus on datacenter IPs (HTTP 406 otherwise). "
+                        "Install: pip install -r requirements.txt  "
+                        "Or set CRAWL_REQUIRE_CURL_CFFI=0 to allow plain requests (usually fails on GCP)."
+                    )
+                    raise SystemExit(1) from ex
+                log.warning("curl_cffi unavailable (%s); using std requests", ex)
             except Exception as ex:
+                if require_cffi:
+                    log.error("curl_cffi session failed: %s", ex)
+                    raise SystemExit(1) from ex
                 log.warning("curl_cffi unavailable (%s); using std requests", ex)
         adapter = HTTPAdapter(pool_connections=32, pool_maxsize=32, max_retries=0)
         s = requests.Session()
         s.mount("https://", adapter)
         s.mount("http://", adapter)
-        log.info(
-            "HTTP client: requests+urllib3 (set CRAWL_USE_CURL_CFFI=1 after: pip install curl_cffi)"
+        log.warning(
+            "HTTP client: requests+urllib3 — likely HTTP 406 on GCP; "
+            "pip install curl_cffi and keep CRAWL_USE_CURL_CFFI=1"
         )
-        return "requests", s
+        return "requests", s, None
 
     def _get(
         self, url: str, headers: dict[str, str], timeout: float
     ) -> Any:
-        return self.session.get(url, headers=headers, timeout=timeout, verify=True)
+        kwargs: dict[str, Any] = {"headers": headers, "timeout": timeout, "verify": True}
+        if self._kind == "cffi" and self._impersonate:
+            kwargs["impersonate"] = self._impersonate
+        return self.session.get(url, **kwargs)
 
     def throttle(self) -> None:
         lo = float(os.environ.get("CRAWL_MIN_DELAY_SEC", "0.55"))
@@ -286,20 +322,36 @@ class CargurusClient:
             hi = lo
         time.sleep(random.uniform(lo, hi))
 
-    def warmup(self, force: bool = False) -> None:
+    def warmup(self, force: bool = False) -> bool:
         if self._warmed and not force:
-            return
+            return True
+        self._warmed = False
         tmo = float(os.environ.get("CRAWL_WARMUP_TIMEOUT_SEC", "28"))
         home = f"{CARGURUS_ORIGIN}/"
         self.throttle()
         r1 = self._get(home, nav_headers(same_site=False, referer=home), tmo)
         inspect_http_response(r1, "warmup_home", home)
+        ok_home = r1.status_code == 200 and _response_body_len(r1) > 5_000
         cars = f"{CARGURUS_ORIGIN}/Cars/"
         self.throttle()
         r2 = self._get(cars, nav_headers(same_site=True, referer=home), tmo)
         inspect_http_response(r2, "warmup_cars", cars)
-        self._warmed = True
-        log.info("warmup | cookie jar primed for CarGurus paths")
+        ok_cars = r2.status_code == 200 and _response_body_len(r2) > 1_000
+        self._warmed = ok_home and ok_cars
+        if self._warmed:
+            log.info("warmup | cookie jar primed for CarGurus paths")
+        else:
+            log.error(
+                "warmup | failed (home ok=%s status=%s bytes=%s | cars ok=%s status=%s bytes=%s). "
+                "On GCP: pip install curl_cffi, then python check_cargurus_access.py",
+                ok_home,
+                r1.status_code,
+                _response_body_len(r1),
+                ok_cars,
+                r2.status_code,
+                _response_body_len(r2),
+            )
+        return self._warmed
 
     def fetch(
         self,
@@ -372,11 +424,12 @@ def get_link(link: str) -> str | None:
         if response.status_code != 200:
             _stats["dealer_pages_failed"] += 1
             return None
-        hints = _html_block_hints(response.text or "")
+        body = _response_text(response)
+        hints = _html_block_hints(body)
         if hints:
             log.warning("dealer_detail | block-like hints on 200: %s", hints[:5])
         _stats["dealer_pages_ok"] += 1
-        return response.text
+        return body
     except Exception:
         _stats["http_errors"] += 1
         _stats["dealer_pages_failed"] += 1
@@ -384,7 +437,7 @@ def get_link(link: str) -> str | None:
         return None
 
 
-def get(url: str) -> requests.Response | Exception:
+def get(url: str) -> Any | Exception:
     try:
         tmo = float(os.environ.get("CRAWL_LISTING_TIMEOUT_SEC", "35"))
         html_doc = _cc().fetch(
@@ -402,7 +455,7 @@ def get(url: str) -> requests.Response | Exception:
         return e
 
 
-def page(response: requests.Response | Exception) -> Any:
+def page(response: Any | Exception) -> Any:
     if isinstance(response, Exception):
         log.error("listing_parse | no response object: %s", response)
         return response
@@ -410,11 +463,12 @@ def page(response: requests.Response | Exception) -> Any:
         log.error(
             "listing_parse | skip (non-200) | status=%s | bytes=%s",
             response.status_code,
-            len(response.text or ""),
+            _response_body_len(response),
         )
         return ValueError(f"listing HTTP {response.status_code}")
+    text = _response_text(response)
     try:
-        soup = BeautifulSoup(response.text, "html.parser")
+        soup = BeautifulSoup(text, "html.parser")
         page_el = soup.select(".info > strong:nth-child(2)")
         name_el = soup.select(".header5")
         name = None
@@ -424,7 +478,7 @@ def page(response: requests.Response | Exception) -> Any:
         for wraper in page_el:
             page_text = wraper.text
         if name is None or page_text is None:
-            hints = _html_block_hints(response.text or "")
+            hints = _html_block_hints(text)
             log.error(
                 "listing_parse | missing expected DOM (.header5 / .info strong) | hints=%s",
                 hints[:5],
@@ -493,7 +547,7 @@ def link_crawler(info: Any, url: str, thread_name: str, number: int) -> tuple:
                 getattr(response, "status_code", None),
             )
             continue
-        soup = BeautifulSoup(response.text, "html.parser")
+        soup = BeautifulSoup(_response_text(response), "html.parser")
         dealer_name = soup.find_all("div", attrs={"class": "details"})
         dealer_address_span = soup.find_all("div", attrs={"class": "address"})
         dealer_address = []
@@ -747,9 +801,20 @@ if __name__ == "__main__":
         os.environ.get("CRAWL_MAX_DELAY_SEC", "2.4"),
         os.environ.get("CRAWL_HTTP_RETRIES", "6"),
     )
-    _cc().warmup()
+    client = _cc()
+    if not client.warmup():
+        log.error(
+            "Aborting: CarGurus warmup failed. Run: python check_cargurus_access.py  "
+            "On GCP: pip install -r requirements.txt"
+        )
+        sys.exit(1)
 
-    state_names = ["Oregon"]
+    states_raw = os.environ.get("CRAWL_STATES", "Oregon")
+    state_names = [s.strip() for s in states_raw.split(",") if s.strip()]
+    if not state_names:
+        log.error("CRAWL_STATES is empty")
+        sys.exit(1)
+    log.info("States to crawl: %s", state_names)
     for state_name in state_names:
         log.info("=== State: %s ===", state_name)
         points = get_state_points(state_name)
