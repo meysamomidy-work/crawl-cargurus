@@ -69,9 +69,29 @@ DEFAULT_HEADERS = {
 }
 
 CARGURUS_ORIGIN = "https://www.cargurus.com"
+CARGURUS_HOME = f"{CARGURUS_ORIGIN}/"
 
-# HTTP 4xx/5xx that often clear after backoff + fresh cookies (WAF / edge on GCP).
+# CarGurus: www root often returns 403 for script/datacenter clients; 418 = non-US egress.
+NON_US_STATUS = 418
 RETRY_STATUSES = frozenset({403, 406, 429, 502, 503, 504})
+
+
+def default_warmup_listing_url() -> str:
+    """Dealer-locator URL the crawler actually uses (not the marketing homepage)."""
+    override = os.environ.get("CRAWL_WARMUP_LISTING_URL", "").strip()
+    if override:
+        return override
+    state = (os.environ.get("CRAWL_STATES", "Oregon").split(",")[0] or "Oregon").strip()
+    lat = os.environ.get("CRAWL_WARMUP_LAT", "44.0")
+    lon = os.environ.get("CRAWL_WARMUP_LON", "-120.5")
+    return (
+        f"{CARGURUS_ORIGIN}/Cars/dl.action?entityId=&address={state}"
+        f"&latitude={lat}&longitude={lon}&distance=100&page=0"
+    )
+
+
+def _response_usable(response: Any, *, min_bytes: int) -> bool:
+    return response.status_code == 200 and _response_body_len(response) >= min_bytes
 
 # Trial defaults: one state, one map grid cell, ten dealer detail pages. Override via env.
 def _crawl_limit_int(key: str, default: int) -> int:
@@ -227,6 +247,20 @@ def inspect_http_response(response: Any, label: str, url_short: str) -> None:
             n,
             _url_for_log(url_short),
         )
+    elif code == NON_US_STATUS:
+        log.error(
+            "%s | HTTP 418 — CarGurus blocks non-US egress; use US VPN/proxy or US hosting | bytes=%s | url=%s",
+            label,
+            n,
+            _url_for_log(url_short),
+        )
+    elif code == 403 and label.startswith("warmup_home"):
+        log.warning(
+            "%s | HTTP 403 on homepage (common for scripts; listing URLs may still work) | bytes=%s | url=%s",
+            label,
+            n,
+            _url_for_log(url_short),
+        )
     elif code in (403, 429):
         log.error(
             "%s | likely blocked or throttled | status=%s | bytes=%s | url=%s",
@@ -346,29 +380,53 @@ class CargurusClient:
             return True
         self._warmed = False
         tmo = float(os.environ.get("CRAWL_WARMUP_TIMEOUT_SEC", "28"))
-        home = f"{CARGURUS_ORIGIN}/"
+        listing = default_warmup_listing_url()
+
         self.throttle()
-        r1 = self._get(home, nav_headers(same_site=False, referer=home), tmo)
-        inspect_http_response(r1, "warmup_home", home)
-        ok_home = r1.status_code == 200 and _response_body_len(r1) > 5_000
+        r_home = self._get(CARGURUS_HOME, nav_headers(same_site=False, referer=CARGURUS_HOME), tmo)
+        inspect_http_response(r_home, "warmup_home", CARGURUS_HOME)
+
+        if r_home.status_code == NON_US_STATUS:
+            log.error("warmup | HTTP 418 on homepage — egress is not treated as US; aborting")
+            return False
+
         cars = f"{CARGURUS_ORIGIN}/Cars/"
         self.throttle()
-        r2 = self._get(cars, nav_headers(same_site=True, referer=home), tmo)
-        inspect_http_response(r2, "warmup_cars", cars)
-        ok_cars = r2.status_code == 200 and _response_body_len(r2) > 1_000
-        self._warmed = ok_home and ok_cars
+        r_cars = self._get(cars, nav_headers(same_site=True, referer=CARGURUS_HOME), tmo)
+        inspect_http_response(r_cars, "warmup_cars", cars)
+
+        self.throttle()
+        r_list = self._get(
+            listing,
+            nav_headers(same_site=False, referer=CARGURUS_HOME),
+            tmo,
+        )
+        inspect_http_response(r_list, "warmup_listing", listing)
+
+        if r_list.status_code == NON_US_STATUS:
+            log.error(
+                "warmup | HTTP 418 on dealer listing — use US egress (VPN/proxy or US ISP hosting)"
+            )
+            return False
+
+        ok_listing = _response_usable(r_list, min_bytes=1_500)
+        # Homepage 403 is normal for GCP/script TLS; cookies from /Cars/ + listing matter for crawl.
+        self._warmed = ok_listing
         if self._warmed:
-            log.info("warmup | cookie jar primed for CarGurus paths")
+            log.info(
+                "warmup | ready (listing OK; home=%s cars=%s — root 403 is OK if listing works)",
+                r_home.status_code,
+                r_cars.status_code,
+            )
         else:
             log.error(
-                "warmup | failed (home ok=%s status=%s bytes=%s | cars ok=%s status=%s bytes=%s). "
-                "On GCP: pip install curl_cffi, then python check_cargurus_access.py",
-                ok_home,
-                r1.status_code,
-                _response_body_len(r1),
-                ok_cars,
-                r2.status_code,
-                _response_body_len(r2),
+                "warmup | failed — need listing HTTP 200 (home=%s bytes=%s | cars=%s | listing=%s bytes=%s). "
+                "Run: python check_cargurus_access.py — on GCP: pip install curl_cffi",
+                r_home.status_code,
+                _response_body_len(r_home),
+                r_cars.status_code,
+                r_list.status_code,
+                _response_body_len(r_list),
             )
         return self._warmed
 
@@ -403,6 +461,8 @@ class CargurusClient:
             inspect_http_response(last, label, url)
             if last.status_code == 200:
                 return last
+            if last.status_code == NON_US_STATUS:
+                return last
             if last.status_code not in RETRY_STATUSES:
                 return last
             sleep_s = backoff * (1.45**attempt) * random.uniform(0.85, 1.15)
@@ -434,7 +494,7 @@ def get_link(link: str) -> str | None:
         response = _cc().fetch(
             url,
             label="dealer_detail",
-            headers_fn=lambda: nav_headers(same_site=True, referer=f"{CARGURUS_ORIGIN}/"),
+            headers_fn=lambda: nav_headers(same_site=True, referer=CARGURUS_HOME),
             timeout=tmo,
         )
         if response is None:
@@ -462,7 +522,7 @@ def get(url: str) -> Any | Exception:
         html_doc = _cc().fetch(
             url,
             label="listing_search",
-            headers_fn=lambda: nav_headers(same_site=False, referer=f"{CARGURUS_ORIGIN}/"),
+            headers_fn=lambda: nav_headers(same_site=False, referer=CARGURUS_HOME),
             timeout=tmo,
         )
         if html_doc is None:
@@ -562,7 +622,7 @@ def link_crawler(info: Any, url: str, thread_name: str, number: int) -> tuple:
         if max_dealers > 0 and len(dealer_list) >= max_dealers:
             break
         link = url + str(start)
-        referer = f"{CARGURUS_ORIGIN}/" if start == 0 else url + str(start - 1)
+        referer = CARGURUS_HOME if start == 0 else url + str(start - 1)
         response = client.fetch(
             link,
             label="listing_grid",

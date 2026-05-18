@@ -5,45 +5,44 @@ Run on the same machine (or in the same Docker network) as your crawler.
 
   python check_cargurus_access.py
 
-Geo lookup uses only the standard library. CarGurus is probed twice when possible:
-  1) urllib (Python OpenSSL TLS) — often HTTP 406 from GCP/AWS even when Chrome works
-  2) curl_cffi Chrome impersonation — same stack as main.py when CRAWL_USE_CURL_CFFI=1
+CarGurus behavior (typical):
+  - https://www.cargurus.com/  → often HTTP 403 for script/datacenter clients (even in US)
+  - Non-US egress              → HTTP 418
+  - Dealer listing URLs        → what main.py actually crawls; 200 here means crawl can work
 
-Install the crawler client on the VPS if probe (1) fails but Chrome works:
-  pip install curl_cffi
+Geo lookup uses only the standard library. HTTP is probed with urllib and curl_cffi when installed.
 
-Note: ip-api.com often returns HTTP 403 from cloud/datacenter IPs; this script
-falls back to other read-only geo endpoints.
-
-If both probes fail with 403/406/451, egress is likely blocked for scripts; try
-curl_cffi, a residential/US proxy, or non-datacenter hosting even for US IPs.
+Install on GCP: pip install curl_cffi
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 import re
 import ssl
 import sys
 import urllib.error
 import urllib.request
 
-CARGURUS_URL = "https://www.cargurus.com/"
+CARGURUS_ORIGIN = "https://www.cargurus.com"
+CARGURUS_HOME = f"{CARGURUS_ORIGIN}/"
+CARGURUS_LISTING_PROBE = (
+    f"{CARGURUS_ORIGIN}/Cars/dl.action?entityId=&address=Oregon"
+    "&latitude=44.0&longitude=-120.5&distance=100&page=0"
+)
 
-# ip-api is first choice but frequently blocks GCP/AWS egress with 403.
 GEO_PROVIDERS: tuple[tuple[str, str], ...] = (
     ("ip-api.com", "https://ip-api.com/json/?fields=status,message,country,countryCode,city,query,isp"),
     ("ifconfig.co", "https://ifconfig.co/json"),
     ("ipinfo.io", "https://ipinfo.io/json"),
 )
 
-# Phrases that suggest a WAF/challenge page — not bare "captcha"/"403" (normal sites
-# embed reCAPTCHA scripts and mention status codes in JS).
 STRONG_BLOCK_HINTS = (
     "unusual traffic from your computer",
     "checking your browser before accessing",
     "enable javascript and cookies to continue",
-    "just a moment...",  # Cloudflare interstitial title pattern (partial match ok)
+    "just a moment...",
     "cf-browser-verification",
     "challenge-platform",
     "you have been blocked",
@@ -51,7 +50,7 @@ STRONG_BLOCK_HINTS = (
     "access to this site has been denied",
     "requests from your network are automated",
     "error code 1020",
-    "attention required!",  # some CDNs
+    "attention required!",
 )
 
 CHROME_UA = (
@@ -59,7 +58,6 @@ CHROME_UA = (
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
-# Match main.py DEFAULT_HEADERS — bare User-Agent + Accept often still gets 406 on GCP.
 HEADERS = {
     "User-Agent": CHROME_UA,
     "Accept": (
@@ -101,7 +99,6 @@ def _get_urllib(
 def _get_curl_cffi(
     url: str, headers: dict[str, str], timeout: float = 20.0
 ) -> tuple[int, bytes, str | None, str]:
-    """Chrome TLS/JA3 impersonation — same approach as main.CargurusClient."""
     from curl_cffi import requests as cfr
 
     impersonate = "chrome131"
@@ -156,7 +153,6 @@ def _parse_geo_json(name: str, raw: bytes) -> dict | None:
 
 
 def fetch_public_geo() -> tuple[dict | None, str | None]:
-    """Return (geo_dict, source_name_or_error)."""
     for name, url in GEO_PROVIDERS:
         try:
             code, raw, _ = _get_urllib(url, _MIN_UA, timeout=15.0)
@@ -178,7 +174,21 @@ def _html_title(html_lower: str) -> str:
     return (m.group(1).strip() if m else "")[:200]
 
 
-def _probe_ok(code: int, body: bytes, low: str, title: str) -> bool:
+def _status_note(code: int, *, is_homepage: bool) -> str:
+    if code == 418:
+        return "Non-US egress — CarGurus returns 418 outside the USA"
+    if code == 403 and is_homepage:
+        return "Expected for many script/datacenter clients; check dealer listing probe below"
+    if code == 403:
+        return "Forbidden — bot/WAF or missing curl_cffi"
+    if code == 406:
+        return "Not Acceptable — use curl_cffi (Python TLS fingerprint)"
+    if code == 200:
+        return "OK"
+    return f"HTTP {code}"
+
+
+def _probe_ok(code: int, body: bytes, low: str, title: str, *, min_bytes: int) -> bool:
     strong_hits = [h for h in STRONG_BLOCK_HINTS if h in low]
     suspicious_title = any(
         x in title.lower()
@@ -186,23 +196,27 @@ def _probe_ok(code: int, body: bytes, low: str, title: str) -> bool:
     )
     return (
         code == 200
-        and len(body) > 10_000
+        and len(body) >= min_bytes
         and "cargurus" in low
         and not strong_hits
         and not suspicious_title
     )
 
 
-def _print_probe_result(label: str, code: int, body: bytes, ctype: str | None) -> bool:
+def _print_probe_result(
+    label: str, url: str, code: int, body: bytes, ctype: str | None, *, min_bytes: int
+) -> bool:
     n = len(body)
     text = body.decode("utf-8", errors="ignore")
     low = text.lower()
     snippet = text[:500].replace("\n", " ")
     title = _html_title(low)
     strong_hits = [h for h in STRONG_BLOCK_HINTS if h in low]
+    is_home = url.rstrip("/") == CARGURUS_ORIGIN
 
     print(f"\n--- {label} ---")
-    print(f"  HTTP status:  {code}")
+    print(f"  URL:          {url}")
+    print(f"  HTTP status:  {code} — {_status_note(code, is_homepage=is_home)}")
     print(f"  Content-Type: {ctype}")
     print(f"  Body bytes:   {n}")
     if title:
@@ -210,13 +224,17 @@ def _print_probe_result(label: str, code: int, body: bytes, ctype: str | None) -
     if n > 0:
         print(f"  Body start:   {snippet!r}...")
 
-    ok = _probe_ok(code, body, low, title)
+    ok = _probe_ok(code, body, low, title, min_bytes=min_bytes)
     if ok:
-        print("  Probe OK: 200, large HTML, normal-looking title.")
+        print("  Probe OK for crawl.")
+    elif code == 418:
+        print("  Probe FAIL: need US egress (VPN/proxy or US residential IP).")
+    elif code == 403 and is_home:
+        print("  Homepage 403 alone does NOT mean crawl is broken — see listing probe.")
     elif code in (403, 406, 429, 451):
-        print(f"  Probe FAIL: HTTP {code} (common for Python/urllib on GCP — see verdict).")
-    elif code == 200 and n < 3000:
-        print("  Probe suspicious: 200 but very small body.")
+        print(f"  Probe FAIL: HTTP {code}.")
+    elif code == 200 and n < min_bytes:
+        print("  Probe suspicious: 200 but small body.")
     else:
         print(f"  Probe unclear: HTTP {code}, {n} bytes.")
     if strong_hits:
@@ -224,9 +242,44 @@ def _print_probe_result(label: str, code: int, body: bytes, ctype: str | None) -
     return ok
 
 
+def _probe_url_urllib(url: str) -> tuple[int, bytes, str | None, str]:
+    code, body, ctype = _get_urllib(url, HEADERS, 20.0)
+    return code, body, ctype, "stdlib urllib"
+
+
+def _probe_url_cffi(url: str) -> tuple[int, bytes, str | None, str]:
+    code, body, ctype, imp = _get_curl_cffi(url, HEADERS, 20.0)
+    return code, body, ctype, f"curl_cffi impersonate={imp}"
+
+
+def _run_client_probe(
+    fetch_one: Callable[[str], tuple[int, bytes, str | None, str]],
+) -> tuple[bool, int | None]:
+    """Returns (listing_ok, 418 if seen)."""
+    listing_ok = False
+    geo_block: int | None = None
+
+    for desc, url, min_b in (
+        ("homepage", CARGURUS_HOME, 10_000),
+        ("dealer listing (crawl path)", CARGURUS_LISTING_PROBE, 1_500),
+    ):
+        try:
+            code, body, ctype, client = fetch_one(url)
+            label = f"{client} — {desc}"
+            ok = _print_probe_result(label, url, code, body, ctype, min_bytes=min_b)
+            if code == 418:
+                geo_block = 418
+            if desc.startswith("dealer"):
+                listing_ok = ok
+        except Exception as e:
+            print(f"\n--- {desc} ---\n  Request failed: {e}")
+    return listing_ok, geo_block
+
+
 def main() -> int:
     print("=== 1) Your public IP / country ===")
     geo, src = fetch_public_geo()
+    cc = "?"
     if not geo:
         print("  Could not determine IP/country (all geo endpoints failed or returned empty).")
     else:
@@ -238,30 +291,23 @@ def main() -> int:
             print(f"  City:    {geo.get('city')}")
         if geo.get("isp"):
             print(f"  ISP/org: {geo.get('isp')}")
-        if cc and cc != "US" and cc != "?":
-            print(
-                "\n  Note: CarGurus listing/dealer URLs sometimes behave badly for non-US egress.\n"
-                "        Homepage 200 does not guarantee search URLs work — compare with main.py runs."
-            )
 
-    print("\n=== 2) GET CarGurus homepage ===")
+    print(
+        "\n=== 2) GET CarGurus (homepage + dealer listing) ===\n"
+        "Note: www.cargurus.com/ often returns 403 for scripts; main.py uses listing URLs."
+    )
 
-    urllib_ok = False
-    try:
-        code_u, body_u, ctype_u = _get_urllib(CARGURUS_URL, HEADERS, timeout=20.0)
-        urllib_ok = _print_probe_result("stdlib urllib (Python TLS)", code_u, body_u, ctype_u)
-    except Exception as e:
-        print(f"\n--- stdlib urllib ---\n  Request failed: {e}")
+    urllib_listing, urllib_418 = _run_client_probe(_probe_url_urllib)
 
-    cffi_ok = False
+    cffi_listing = False
+    cffi_418: int | None = None
     cffi_note: str | None = None
     try:
-        code_c, body_c, ctype_c, imp = _get_curl_cffi(CARGURUS_URL, HEADERS, timeout=20.0)
-        cffi_ok = _print_probe_result(f"curl_cffi impersonate={imp}", code_c, body_c, ctype_c)
+        cffi_listing, cffi_418 = _run_client_probe(_probe_url_cffi)
     except ImportError:
         cffi_note = "curl_cffi not installed — pip install curl_cffi"
     except Exception as e:
-        cffi_note = f"curl_cffi probe failed: {e}"
+        cffi_note = f"curl_cffi failed: {e}"
 
     if cffi_note:
         print(f"\n--- curl_cffi ---\n  Skipped: {cffi_note}")
@@ -273,30 +319,31 @@ def main() -> int:
     )
 
     print("\n=== 3) Verdict ===")
-    if urllib_ok or cffi_ok:
-        if cffi_ok and not urllib_ok:
-            print(
-                "  Crawler path: use curl_cffi (main.py default when installed).\n"
-                "  urllib/requests alone will likely keep returning 406 on this host."
-            )
-        else:
-            print("  At least one probe succeeded — crawler HTTP should work with that client.")
-        print("  (Ignore random 'captcha'/'403' in huge pages — often legal/script text.)")
+    if urllib_418 == 418 or cffi_418 == 418:
+        print("  HTTP 418: egress is not US — CarGurus blocks non-US IPs. Use US VPN/proxy.")
+        if cc and cc != "US":
+            print(f"  Geo says {cc} — matches 418 behavior.")
+        return 2
+
+    if cffi_listing or urllib_listing:
+        print("  Dealer listing probe OK — main.py crawl path should work.")
+        if cffi_listing and not urllib_listing:
+            print("  Use curl_cffi in production (pip install curl_cffi; default in main.py).")
+        print("  Homepage 403 is normal and ignored by main.py warmup.")
         return 0
+
+    if cc and cc != "US" and cc != "?":
+        print(f"  Country is {cc} — expect HTTP 418 from CarGurus; use US egress.")
 
     if is_cloud:
         print(
-            "  Datacenter egress (e.g. Google Cloud) + script TLS often gets HTTP 406 while\n"
-            "  Chrome on the same VM works — the site allows browsers, not Python's SSL fingerprint."
+            "  US datacenter IP: homepage 403 + listing fail often means install curl_cffi,\n"
+            "  not that Chrome-on-VM working proves Python will (different TLS fingerprint)."
         )
     if cffi_note and "not installed" in cffi_note:
-        print(f"  Next step: {cffi_note} then re-run this script and ensure main.py logs")
-        print("  'HTTP client: curl_cffi impersonate=...'.")
-    elif not cffi_ok and not cffi_note:
-        print("  Both probes failed — try a US residential proxy or non-cloud host.")
+        print(f"  Next: {cffi_note}")
     else:
-        print("  Probes failed — review HTTP status and body snippets above.")
-
+        print("  Listing probe failed — fix curl_cffi or use US residential/non-cloud egress.")
     return 2
 
 
