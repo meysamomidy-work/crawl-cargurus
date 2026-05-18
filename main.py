@@ -73,6 +73,25 @@ CARGURUS_ORIGIN = "https://www.cargurus.com"
 # HTTP 4xx/5xx that often clear after backoff + fresh cookies (WAF / edge on GCP).
 RETRY_STATUSES = frozenset({403, 406, 429, 502, 503, 504})
 
+# Trial defaults: one state, one map grid cell, ten dealer detail pages. Override via env.
+def _crawl_limit_int(key: str, default: int) -> int:
+    v = os.environ.get(key)
+    if v is None or not str(v).strip():
+        return default
+    return max(0, int(v))
+
+
+def crawl_max_dealers() -> int:
+    return _crawl_limit_int("CRAWL_MAX_DEALERS", 10)
+
+
+def crawl_max_grid_cells() -> int:
+    return _crawl_limit_int("CRAWL_MAX_GRID_CELLS", 1)
+
+
+def crawl_max_states() -> int:
+    return _crawl_limit_int("CRAWL_MAX_STATES", 1)
+
 
 def _env_bool(key: str, default: bool) -> bool:
     v = os.environ.get(key)
@@ -525,13 +544,23 @@ def link_crawler(info: Any, url: str, thread_name: str, number: int) -> tuple:
         raise ValueError("empty listing page info")
     page_clean = str(page_raw).replace(",", "")
     page_count = int(page_clean) // 10 + 1
+    max_dealers = crawl_max_dealers()
+    if max_dealers > 0:
+        page_count = min(page_count, max(1, (max_dealers + 9) // 10))
     name = info[0]
     name = str(name).replace(",", "-").replace(" ", "").split()[0]
-    log.info("link_crawler | grid_pages=%s name=%s", page_count, name)
+    log.info(
+        "link_crawler | grid_pages=%s name=%s max_dealers=%s",
+        page_count,
+        name,
+        max_dealers or "unlimited",
+    )
 
     client = _cc()
     grid_tmo = float(os.environ.get("CRAWL_GRID_TIMEOUT_SEC", "28"))
     for start in range(page_count):
+        if max_dealers > 0 and len(dealer_list) >= max_dealers:
+            break
         link = url + str(start)
         referer = f"{CARGURUS_ORIGIN}/" if start == 0 else url + str(start - 1)
         response = client.fetch(
@@ -561,12 +590,17 @@ def link_crawler(info: Any, url: str, thread_name: str, number: int) -> tuple:
         inv_anchors = soup.find_all("a", attrs={"class": "viewInventory"})
         href_list = [a.get("href") for a in inv_anchors if a.get("href")]
         for (inv_href, j, k) in zip(href_list, dealer_address, dealer_name):
+            if max_dealers > 0 and len(dealer_list) >= max_dealers:
+                break
             j = " ".join(j.split())
             dealer_list.append([k.strong.text, j, inv_href])
         with open("failed.csv", "w", newline="") as f:
             writer = csv.writer(f)
             for item in failed:
                 writer.writerow([item])
+
+    if max_dealers > 0:
+        dealer_list = dealer_list[:max_dealers]
 
     df = pd.DataFrame(dealer_list)
     if thread_name == "one":
@@ -718,9 +752,13 @@ def parser(html_doc: str | None) -> tuple:
 
 def crawler(links: Any, name: str, thread_name: str, number: int) -> None:
     rows: list = []
-    total = len(links) if hasattr(links, "__len__") else 0
+    max_dealers = crawl_max_dealers()
+    link_list = list(links)
+    if max_dealers > 0:
+        link_list = link_list[:max_dealers]
+    total = len(link_list)
     log.info("crawler | starting %s dealer pages for %s_%s", total, name, number)
-    for idx, link in enumerate(links):
+    for idx, link in enumerate(link_list):
         try:
             out_put = parser(get_link(link))
             rows.append(out_put)
@@ -814,10 +852,22 @@ if __name__ == "__main__":
     if not state_names:
         log.error("CRAWL_STATES is empty")
         sys.exit(1)
-    log.info("States to crawl: %s", state_names)
+    max_states = crawl_max_states()
+    if max_states > 0:
+        state_names = state_names[:max_states]
+    max_cells = crawl_max_grid_cells()
+    log.info(
+        "Crawl limits | states=%s (max %s) | grid_cells_per_state=%s | max_dealers=%s",
+        state_names,
+        max_states or "all",
+        max_cells or "all",
+        crawl_max_dealers() or "unlimited",
+    )
     for state_name in state_names:
         log.info("=== State: %s ===", state_name)
         points = get_state_points(state_name)
+        if max_cells > 0:
+            points = points[:max_cells]
         for number, (latitude, longitude) in enumerate(points):
             log.info(
                 "--- Grid cell %s/%s | lat=%.5f lon=%.5f ---",
