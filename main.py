@@ -6,6 +6,8 @@ import random
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from typing import Any
 
 import geopandas as gpd
@@ -173,7 +175,21 @@ STATE_CSV_HEADER = (
 
 _WORKER_QUEUE_SENTINEL = object()
 META_WRITE_LOCK = threading.Lock()
+_PROGRESS_LOCK = threading.Lock()
+_STATS_LOCK = threading.Lock()
+_STATE_REGISTRY_LOCK = threading.Lock()
 _thread_local = threading.local()
+
+_STATE_SEEN: dict[str, set[str]] = {}
+_STATE_FILE_LOCKS: dict[str, threading.Lock] = {}
+_STATE_DEALER_COUNT: dict[str, int] = {}
+
+
+@dataclass(frozen=True, slots=True)
+class GridTask:
+    state: str
+    latitude: float
+    longitude: float
 
 
 def _env_bool(key: str, default: bool) -> bool:
@@ -231,18 +247,23 @@ def _html_block_hints(html: str) -> list[str]:
     return [h for h in BLOCK_HINTS if h in low]
 
 
+def _stat_inc(key: str, n: int = 1) -> None:
+    with _STATS_LOCK:
+        _stats[key] = _stats.get(key, 0) + n
+
+
 def _record_http_status(code: int) -> None:
-    _stats["http_requests"] += 1
+    _stat_inc("http_requests")
     if 200 <= code < 300:
-        _stats["http_2xx"] += 1
+        _stat_inc("http_2xx")
     elif code == 403:
-        _stats["http_403"] += 1
+        _stat_inc("http_403")
     elif code == 429:
-        _stats["http_429"] += 1
+        _stat_inc("http_429")
     elif 400 <= code < 500:
-        _stats["http_other_4xx"] += 1
+        _stat_inc("http_other_4xx")
     elif code >= 500:
-        _stats["http_5xx"] += 1
+        _stat_inc("http_5xx")
 
 
 def _url_for_log(url: str, *, head: int = 72, tail: int = 56) -> str:
@@ -276,9 +297,9 @@ def inspect_http_response(response: Any, label: str, url_short: str) -> None:
     n = len(text)
     hints = _html_block_hints(text)
     if hints:
-        _stats["block_hint_hits"] += 1
+        _stat_inc("block_hint_hits")
     if n < 1500 and code == 200:
-        _stats["tiny_html"] += 1
+        _stat_inc("tiny_html")
 
     if code == 200 and not hints and n >= 1500:
         log.info(
@@ -506,7 +527,7 @@ class CargurusClient:
         last: Any | None = None
         for attempt in range(max_r):
             if attempt > 0:
-                _stats["http_retry_rounds"] += 1
+                _stat_inc("http_retry_rounds")
                 log.warning("%s | retry round %s/%s", label, attempt + 1, max_r)
                 self.warmup(force=True)
             elif not self._warmed:
@@ -515,7 +536,7 @@ class CargurusClient:
             try:
                 last = self._get(url, headers_fn(), timeout)
             except Exception as e:
-                _stats["http_errors"] += 1
+                _stat_inc("http_errors")
                 log.warning("%s | attempt %s transport error: %s", label, attempt + 1, e)
                 last = None
                 time.sleep(backoff * (1.6**attempt) * random.uniform(0.85, 1.15))
@@ -600,16 +621,6 @@ def _load_seen_dealer_urls(state: str) -> set[str]:
     return seen
 
 
-def _init_state_csv(state: str) -> set[str]:
-    path = f"crawled/{state}.csv"
-    if _env_bool("CRAWL_RESUME", True) and os.path.isfile(path) and os.path.getsize(path) > 0:
-        seen = _load_seen_dealer_urls(state)
-        log.info("resume | %s already has %s dealer(s)", state, len(seen))
-        return seen
-    _write_state_csv_header(state)
-    return set()
-
-
 def _format_result_row(
     list_name: str,
     list_address: str,
@@ -660,6 +671,81 @@ def _delay_range() -> tuple[float, float]:
     return lo, hi
 
 
+def _detail_workers() -> int:
+    """Concurrent dealer-detail HTTP fetches per grid cell (each uses thread-local session)."""
+    return max(1, int(os.environ.get("CRAWL_DETAIL_WORKERS", "1")))
+
+
+def _state_file_lock(state: str) -> threading.Lock:
+    with _STATE_REGISTRY_LOCK:
+        lock = _STATE_FILE_LOCKS.get(state)
+        if lock is None:
+            lock = threading.Lock()
+            _STATE_FILE_LOCKS[state] = lock
+        return lock
+
+
+def _ensure_state_tracking(state: str) -> None:
+    with _STATE_REGISTRY_LOCK:
+        if state in _STATE_SEEN:
+            return
+        path = f"crawled/{state}.csv"
+        if _env_bool("CRAWL_RESUME", True) and os.path.isfile(path) and os.path.getsize(path) > 0:
+            seen = _load_seen_dealer_urls(state)
+            _STATE_SEEN[state] = seen
+            _STATE_DEALER_COUNT[state] = len(seen)
+            log.info("resume | %s already has %s dealer(s)", state, len(seen))
+        else:
+            _STATE_SEEN[state] = set()
+            _STATE_DEALER_COUNT[state] = 0
+            _write_state_csv_header(state)
+
+
+def _reserve_dealer_slot(state: str, page_url: str) -> bool:
+    max_per_state = _crawl_limit_int("CRAWL_MAX_DEALERS_PER_STATE", 0)
+    with _STATE_REGISTRY_LOCK:
+        seen = _STATE_SEEN[state]
+        if page_url in seen:
+            return False
+        if max_per_state > 0 and _STATE_DEALER_COUNT.get(state, 0) >= max_per_state:
+            return False
+        seen.add(page_url)
+        _STATE_DEALER_COUNT[state] = _STATE_DEALER_COUNT.get(state, 0) + 1
+        return True
+
+
+def _release_dealer_slot(state: str, page_url: str) -> None:
+    with _STATE_REGISTRY_LOCK:
+        seen = _STATE_SEEN.get(state)
+        if not seen or page_url not in seen:
+            return
+        seen.discard(page_url)
+        _STATE_DEALER_COUNT[state] = max(0, _STATE_DEALER_COUNT.get(state, 1) - 1)
+
+
+def _append_state_row(state: str, line: str) -> None:
+    with _state_file_lock(state):
+        path = f"crawled/{state}.csv"
+        row = line if line.endswith("\n") else line + "\n"
+        os.makedirs("crawled", exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(row)
+
+
+def _build_grid_tasks(states: list[str]) -> list[GridTask]:
+    max_cells = crawl_max_grid_cells()
+    tasks: list[GridTask] = []
+    for state in states:
+        points = get_state_points(state)
+        if max_cells > 0:
+            points = points[:max_cells]
+        for latitude, longitude in points:
+            tasks.append(GridTask(state, latitude, longitude))
+    if _env_bool("CRAWL_SHUFFLE_GRIDS", True):
+        random.shuffle(tasks)
+    return tasks
+
+
 def get_link(link: str) -> str | None:
     try:
         url = f"{CARGURUS_ORIGIN}/" + link.lstrip("/")
@@ -671,20 +757,20 @@ def get_link(link: str) -> str | None:
             timeout=tmo,
         )
         if response is None:
-            _stats["dealer_pages_failed"] += 1
+            _stat_inc("dealer_pages_failed")
             return None
         if response.status_code != 200:
-            _stats["dealer_pages_failed"] += 1
+            _stat_inc("dealer_pages_failed")
             return None
         body = _response_text(response)
         hints = _html_block_hints(body)
         if hints:
             log.warning("dealer_detail | block-like hints on 200: %s", hints[:5])
-        _stats["dealer_pages_ok"] += 1
+        _stat_inc("dealer_pages_ok")
         return body
     except Exception:
-        _stats["http_errors"] += 1
-        _stats["dealer_pages_failed"] += 1
+        _stat_inc("http_errors")
+        _stat_inc("dealer_pages_failed")
         log.exception("dealer_detail | exception | link=%s", link[:200])
         return None
 
@@ -702,7 +788,7 @@ def get(url: str) -> Any | Exception:
             return RuntimeError("listing_search: no response after retries")
         return html_doc
     except Exception as e:
-        _stats["http_errors"] += 1
+        _stat_inc("http_errors")
         log.exception("listing_search | exception | url=%s", url[:200])
         return e
 
@@ -1006,98 +1092,101 @@ def parser(html_doc: str | None) -> tuple:
     )
 
 
-def process_state(state: str, worker_id: int) -> None:
-    """Discover dealers on a state grid and append each detail row to crawled/{state}.csv."""
-    tag = f"W{worker_id}"
-    seen = _init_state_csv(state)
-    max_per_state = _crawl_limit_int("CRAWL_MAX_DEALERS_PER_STATE", 0)
-    points = get_state_points(state)
-    max_cells = crawl_max_grid_cells()
-    if max_cells > 0:
-        points = points[:max_cells]
-
-    client = _cc()
-    dealers_written = 0
-    dmin, dmax = _delay_range()
-    grid_bar = tqdm(points, desc=f"{tag} {state}", unit="grid")
-
-    for latitude, longitude in grid_bar:
-        if max_per_state > 0 and dealers_written >= max_per_state:
-            break
-        base_url = (
-            f"{CARGURUS_ORIGIN}/Cars/dl.action?entityId=&address={state}"
-            f"&latitude={latitude}&longitude={longitude}&distance=100&page="
+def process_grid_cell(task: GridTask, worker_id: int, client: CargurusClient) -> int:
+    """One map grid cell: discover listing pages, fetch dealer details, append CSV rows."""
+    _ensure_state_tracking(task.state)
+    base_url = (
+        f"{CARGURUS_ORIGIN}/Cars/dl.action?entityId=&address={task.state}"
+        f"&latitude={task.latitude}&longitude={task.longitude}&distance=100&page="
+    )
+    try:
+        response = get(base_url + "0")
+        info = page(response)
+        if isinstance(info, Exception):
+            raise info
+        dealers = discover_dealers_from_grid(info, base_url, client)
+    except Exception as exc:
+        _append_line(
+            "crawled/meta/error_grids.csv",
+            f"{task.state}|{task.latitude:.5f}|{task.longitude:.5f}|{type(exc).__name__}: {exc}",
         )
-        new_in_grid = 0
+        log.warning(
+            "W%s %s grid (%.4f, %.4f) failed: %s",
+            worker_id,
+            task.state,
+            task.latitude,
+            task.longitude,
+            exc,
+        )
+        return 0
+
+    work: list[tuple[str, str, str, str]] = []
+    for list_name, address, href in dealers:
+        page_url = _dealer_page_url(href)
+        if _reserve_dealer_slot(task.state, page_url):
+            work.append((list_name, address, href, page_url))
+
+    written = 0
+    detail_n = _detail_workers()
+
+    def _fetch_one(item: tuple[str, str, str, str]) -> bool:
+        list_name, address, href, page_url = item
         try:
-            response = get(base_url + "0")
-            info = page(response)
-            if isinstance(info, Exception):
-                raise info
-            dealers = discover_dealers_from_grid(info, base_url, client)
+            parsed = parser(get_link(href))
         except Exception as exc:
-            _append_line(
-                "crawled/meta/error_grids.csv",
-                f"{state}|{latitude:.5f}|{longitude:.5f}|{type(exc).__name__}: {exc}",
-            )
-            log.warning(
-                "%s %s grid (%.4f, %.4f) failed: %s",
-                tag,
-                state,
-                latitude,
-                longitude,
-                exc,
-            )
-            time.sleep(random.uniform(dmin, dmax))
-            continue
+            _release_dealer_slot(task.state, page_url)
+            _stat_inc("parse_exceptions")
+            log.exception("W%s dealer failed %s: %s", worker_id, page_url, exc)
+            return False
+        row = _format_result_row(list_name, address, href, parsed, task.state)
+        _append_state_row(task.state, row)
+        print(f"[W{worker_id} {task.state}] {parsed[0]}")
+        return True
 
-        for list_name, address, href in dealers:
-            if max_per_state > 0 and dealers_written >= max_per_state:
-                break
-            page_url = _dealer_page_url(href)
-            if page_url in seen:
-                continue
-            seen.add(page_url)
-            try:
-                parsed = parser(get_link(href))
-            except Exception as exc:
-                _stats["parse_exceptions"] += 1
-                log.exception("%s dealer failed %s: %s", tag, page_url, exc)
-                time.sleep(3)
-                continue
-            row = _format_result_row(list_name, address, href, parsed, state)
-            _append_line(f"crawled/{state}.csv", row)
-            dealers_written += 1
-            new_in_grid += 1
-            print(f"[{tag} {state}] {parsed[0]}")
-            time.sleep(random.uniform(dmin, dmax))
+    if detail_n <= 1:
+        for item in work:
+            if _fetch_one(item):
+                written += 1
+    else:
+        with ThreadPoolExecutor(max_workers=detail_n) as pool:
+            futures = [pool.submit(_fetch_one, item) for item in work]
+            for fut in as_completed(futures):
+                if fut.result():
+                    written += 1
 
-        grid_bar.set_postfix(dealers=dealers_written, new=new_in_grid, refresh=False)
-        if dealers_written and dealers_written % 25 == 0:
-            log_stats_snapshot(f"{tag}_{state}_{dealers_written}")
-
-    log.info("%s finished %s | dealers_written=%s", tag, state, dealers_written)
-    log_stats_snapshot(f"finished_{state}")
+    dmin, dmax = _delay_range()
+    time.sleep(random.uniform(dmin, dmax))
+    return written
 
 
-def worker_entry(worker_id: int, task_queue: queue.Queue) -> None:
+def worker_entry(worker_id: int, task_queue: queue.Queue, progress: tqdm) -> None:
     tag = f"[W{worker_id}]"
     try:
+        client = _cc()
+        print(f"{tag} HTTP session ready")
         while True:
             item = task_queue.get()
             if item is _WORKER_QUEUE_SENTINEL:
                 break
-            state = str(item)
-            print(f"{tag} Starting {state}")
+            task = item
+            assert isinstance(task, GridTask)
             try:
-                process_state(state, worker_id)
+                n = process_grid_cell(task, worker_id, client)
             except Exception as exc:
-                log.exception("%s failed on %s: %s", tag, state, exc)
+                log.exception("%s grid failed %s: %s", tag, task.state, exc)
                 _append_line(
-                    "crawled/meta/error_states.csv",
-                    f"{state}|{type(exc).__name__}: {exc}",
+                    "crawled/meta/error_grids.csv",
+                    f"{task.state}|{task.latitude:.5f}|{task.longitude:.5f}|{type(exc).__name__}: {exc}",
                 )
-            print(f"{tag} Completed {state}")
+                n = 0
+            with _PROGRESS_LOCK:
+                progress.update(1)
+                progress.set_postfix(
+                    worker=worker_id,
+                    state=task.state,
+                    last=n,
+                    refresh=False,
+                )
     finally:
         print(f"{tag} exiting")
 
@@ -1112,28 +1201,37 @@ def main() -> None:
         sys.exit(1)
 
     n = _num_workers()
+    detail_n = _detail_workers()
+    print("[cargurus] Building grid task list (shapefile lookup per state)...")
+    grid_tasks = _build_grid_tasks(states)
+    if not grid_tasks:
+        log.error("No grid tasks generated")
+        sys.exit(1)
+
     print(
-        f"[cargurus] {len(states)} state(s), {n} worker thread(s) → crawled/<State>.csv"
+        f"[cargurus] {len(states)} state(s) | {len(grid_tasks)} grid task(s) | "
+        f"{n} worker thread(s) | {detail_n} detail fetch(es) per grid | → crawled/<State>.csv"
     )
     log.info(
-        "Starting crawl | workers=%s | states=%s | grid_cells=%s | dealers_per_state=%s",
+        "Starting crawl | workers=%s | detail_workers=%s | states=%s | grids=%s",
         n,
+        detail_n,
         len(states),
-        crawl_max_grid_cells() or "all",
-        _crawl_limit_int("CRAWL_MAX_DEALERS_PER_STATE", 0) or "unlimited",
+        len(grid_tasks),
     )
 
     task_queue: queue.Queue = queue.Queue()
-    for state in states:
-        task_queue.put(state)
+    for task in grid_tasks:
+        task_queue.put(task)
     for _ in range(n):
         task_queue.put(_WORKER_QUEUE_SENTINEL)
 
+    progress = tqdm(total=len(grid_tasks), desc="grids", unit="grid")
     stagger = float(os.environ.get("CRAWL_STAGGER_SEC", "3"))
     threads = [
         threading.Thread(
             target=worker_entry,
-            args=(wid, task_queue),
+            args=(wid, task_queue, progress),
             name=f"cargurus-worker-{wid}",
             daemon=False,
         )
@@ -1144,6 +1242,7 @@ def main() -> None:
         time.sleep(random.uniform(0.5, max(stagger, 0.5)))
     for t in threads:
         t.join()
+    progress.close()
 
     print("[cargurus] All workers finished.")
     log_stats_snapshot("final")
