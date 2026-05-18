@@ -1,4 +1,5 @@
 import csv
+import json
 import logging
 import os
 import random
@@ -678,23 +679,92 @@ def link_crawler(info: Any, url: str, thread_name: str, number: int) -> tuple:
     return path, name
 
 
+def _extract_remix_route_loader(html: str) -> dict | None:
+    """CarGurus dealer inventory pages embed SSR data in window.__remixContext."""
+    marker = "window.__remixContext = "
+    start = html.find(marker)
+    if start < 0:
+        return None
+    start += len(marker)
+    try:
+        data, _ = json.JSONDecoder().raw_decode(html, start)
+    except json.JSONDecodeError:
+        return None
+    loader_data = data.get("state", {}).get("loaderData") or {}
+    for val in loader_data.values():
+        if isinstance(val, dict) and "dealerInfo" in val:
+            return val
+    return None
+
+
+def _normalize_time_text(value: str) -> str:
+    return value.replace("\u202f", " ").replace("\u00a0", " ").strip()
+
+
+def _format_business_hours(business_hours: dict) -> str:
+    if not business_hours:
+        return "Not Specified"
+    parts: list[str] = []
+    for day, info in business_hours.items():
+        if not isinstance(info, dict) or info.get("availability") != "Open":
+            continue
+        open_t = _normalize_time_text(str(info.get("openTime", "")))
+        close_t = _normalize_time_text(str(info.get("closeTime", "")))
+        if open_t and close_t:
+            parts.append(f"{day[:3]} {open_t}-{close_t}")
+    return " ".join(parts) if parts else "Not Specified"
+
+
+def _parser_from_remix(html_doc: str) -> tuple | None:
+    route = _extract_remix_route_loader(html_doc)
+    if not route:
+        return None
+    dealer = route.get("dealerInfo") or {}
+    search = route.get("search") or {}
+    name = (dealer.get("name") or "").strip()
+    if not name:
+        return None
+    phone = (
+        dealer.get("localizedSalesPhone")
+        or dealer.get("salesPhone")
+        or "Not Specified"
+    )
+    website = dealer.get("website") or "Not Specified"
+    count = search.get("totalListings")
+    count_str = str(count) if count is not None else "0"
+    score = dealer.get("averageRating", 0)
+    reviews = dealer.get("reviewCount", 0)
+    hours = _format_business_hours(dealer.get("businessHours") or {})
+    return (name, phone, website, count_str, score, reviews, hours)
+
+
+def _parser_empty() -> tuple:
+    return (
+        "bad url",
+        "Not Specified",
+        "Not Specified",
+        "0",
+        0,
+        0,
+        "Not Specified",
+    )
+
+
 def parser(html_doc: str | None) -> tuple:
     if not html_doc:
         log.warning("parser | empty HTML (dealer page failed or blocked)")
-        return (
-            "bad url",
-            "Not Specified",
-            "Not Specified",
-            "0",
-            0,
-            0,
-            "Not Specified",
-        )
-    try:
-        with open("file_path.txt", "w", encoding="utf-8") as file:
-            file.write(html_doc)
-    except Exception as e:
-        log.warning("parser | could not save debug HTML: %s", e)
+        return _parser_empty()
+
+    remix_row = _parser_from_remix(html_doc)
+    if remix_row is not None:
+        return remix_row
+
+    if _env_bool("CRAWL_SAVE_DEALER_HTML", False):
+        try:
+            with open("file_path.txt", "w", encoding="utf-8") as file:
+                file.write(html_doc)
+        except Exception as e:
+            log.warning("parser | could not save debug HTML: %s", e)
 
     failed: list = []
     soup = BeautifulSoup(html_doc, "html.parser")
@@ -798,7 +868,13 @@ def parser(html_doc: str | None) -> tuple:
             return "Not Specified"
 
     dname = dealer_name_fn()
-    out_put = (
+    if dname == "bad url":
+        hints = _html_block_hints(html_doc)
+        log.warning(
+            "parser | legacy DOM parse failed (no __remixContext dealerInfo); hints=%s",
+            hints[:5],
+        )
+    return (
         dname,
         dealer_phone_fn(),
         dealer_web_fn(),
@@ -807,7 +883,6 @@ def parser(html_doc: str | None) -> tuple:
         dealer_reviews_fn(),
         dealer_time_fn(),
     )
-    return out_put
 
 
 def crawler(links: Any, name: str, thread_name: str, number: int) -> None:
