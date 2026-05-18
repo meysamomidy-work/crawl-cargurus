@@ -1,16 +1,17 @@
-import csv
 import json
 import logging
 import os
+import queue
 import random
 import sys
+import threading
 import time
 from typing import Any
 
 import geopandas as gpd
 import numpy as np
-import pandas as pd
 import requests
+from tqdm import tqdm
 from requests.adapters import HTTPAdapter
 from bs4 import BeautifulSoup
 from shapely.geometry import Point
@@ -103,15 +104,76 @@ def _crawl_limit_int(key: str, default: int) -> int:
 
 
 def crawl_max_dealers() -> int:
-    return _crawl_limit_int("CRAWL_MAX_DEALERS", 10)
+    """Per grid cell during discovery; 0 = unlimited."""
+    return _crawl_limit_int("CRAWL_MAX_DEALERS", 0)
 
 
 def crawl_max_grid_cells() -> int:
-    return _crawl_limit_int("CRAWL_MAX_GRID_CELLS", 1)
+    """Per state; 0 = all grid points."""
+    return _crawl_limit_int("CRAWL_MAX_GRID_CELLS", 0)
 
 
 def crawl_max_states() -> int:
-    return _crawl_limit_int("CRAWL_MAX_STATES", 1)
+    """0 = all configured states."""
+    return _crawl_limit_int("CRAWL_MAX_STATES", 0)
+
+
+# Same jurisdiction order as cars crowler/main8.py (override with CRAWL_STATES).
+DEFAULT_STATES: list[str] = [
+    "Delaware",
+    "District of Columbia",
+    "Virginia",
+    "Maryland",
+    "West Virginia",
+    "North Carolina",
+    "South Carolina",
+    "Georgia",
+    "Florida",
+    "Alabama",
+    "Tennessee",
+    "Mississippi",
+    "Kentucky",
+    "Ohio",
+    "Indiana",
+    "Michigan",
+    "Iowa",
+    "Wisconsin",
+    "Minnesota",
+    "South Dakota",
+    "North Dakota",
+    "Montana",
+    "Illinois",
+    "Missouri",
+    "Kansas",
+    "Nebraska",
+    "Louisiana",
+    "Arkansas",
+    "Oklahoma",
+    "Texas",
+    "Colorado",
+    "Idaho",
+    "Utah",
+    "Arizona",
+    "New Mexico",
+    "Nevada",
+    "California",
+    "Hawaii",
+    "American Samoa",
+    "Guam",
+    "Northern Mariana Islands",
+    "Oregon",
+    "Washington",
+    "Alaska",
+]
+
+STATE_CSV_HEADER = (
+    "Name|Dealer Page Link|List Address|Phone|Website|Inventory Count|"
+    "Score|Review Count|Business Hours|State\n"
+)
+
+_WORKER_QUEUE_SENTINEL = object()
+META_WRITE_LOCK = threading.Lock()
+_thread_local = threading.local()
 
 
 def _env_bool(key: str, default: bool) -> bool:
@@ -478,14 +540,124 @@ class CargurusClient:
         return last
 
 
-_cc_singleton: CargurusClient | None = None
-
-
 def _cc() -> CargurusClient:
-    global _cc_singleton
-    if _cc_singleton is None:
-        _cc_singleton = CargurusClient()
-    return _cc_singleton
+    """One HTTP session + cookie jar per worker thread."""
+    client = getattr(_thread_local, "client", None)
+    if client is None:
+        client = CargurusClient()
+        if not client.warmup():
+            raise RuntimeError("CarGurus warmup failed (check US egress / curl_cffi)")
+        _thread_local.client = client
+    return client
+
+
+def _csv_field(value: Any) -> str:
+    return str(value if value is not None else "").replace("|", " ").replace("\n", " ").strip()
+
+
+def _append_line(path: str, line: str) -> None:
+    line = line if line.endswith("\n") else line + "\n"
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    rel = os.path.normpath(path).replace("\\", "/").lower()
+    if rel.startswith("crawled/meta/"):
+        with META_WRITE_LOCK:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line)
+    else:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+
+
+def _dealer_page_url(href: str) -> str:
+    href = (href or "").strip()
+    if href.startswith("http"):
+        return href.split("?")[0]
+    return f"{CARGURUS_ORIGIN}/{href.lstrip('/')}".split("?")[0]
+
+
+def _write_state_csv_header(state: str) -> None:
+    os.makedirs("crawled", exist_ok=True)
+    with open(f"crawled/{state}.csv", "w", encoding="utf-8") as f:
+        f.write(STATE_CSV_HEADER)
+
+
+def _load_seen_dealer_urls(state: str) -> set[str]:
+    path = f"crawled/{state}.csv"
+    seen: set[str] = set()
+    if not os.path.isfile(path):
+        return seen
+    try:
+        with open(path, encoding="utf-8") as f:
+            f.readline()
+            for line in f:
+                parts = line.strip().split("|")
+                if len(parts) >= 2 and parts[1]:
+                    seen.add(parts[1])
+    except OSError as exc:
+        log.warning("resume | could not read %s: %s", path, exc)
+    return seen
+
+
+def _init_state_csv(state: str) -> set[str]:
+    path = f"crawled/{state}.csv"
+    if _env_bool("CRAWL_RESUME", True) and os.path.isfile(path) and os.path.getsize(path) > 0:
+        seen = _load_seen_dealer_urls(state)
+        log.info("resume | %s already has %s dealer(s)", state, len(seen))
+        return seen
+    _write_state_csv_header(state)
+    return set()
+
+
+def _format_result_row(
+    list_name: str,
+    list_address: str,
+    href: str,
+    parsed: tuple,
+    state: str,
+) -> str:
+    name, phone, website, inv, score, reviews, hours = parsed
+    if name == "bad url" and list_name:
+        name = list_name
+    return "|".join(
+        [
+            _csv_field(name),
+            _csv_field(_dealer_page_url(href)),
+            _csv_field(list_address),
+            _csv_field(phone),
+            _csv_field(website),
+            _csv_field(inv),
+            _csv_field(score),
+            _csv_field(reviews),
+            _csv_field(hours),
+            _csv_field(state),
+        ]
+    )
+
+
+def _num_workers() -> int:
+    return max(1, int(os.environ.get("CRAWL_NUM_WORKERS", "3")))
+
+
+def _configured_states() -> list[str]:
+    raw = os.environ.get("CRAWL_STATES", "").strip()
+    if raw:
+        names = [s.strip() for s in raw.split(",") if s.strip()]
+    else:
+        names = list(DEFAULT_STATES)
+    max_states = crawl_max_states()
+    if max_states > 0:
+        names = names[:max_states]
+    return names
+
+
+def _delay_range() -> tuple[float, float]:
+    lo = float(os.environ.get("CRAWL_MIN_DELAY_SEC", "0.55"))
+    hi = float(os.environ.get("CRAWL_MAX_DELAY_SEC", "2.4"))
+    if hi < lo:
+        lo, hi = hi, lo
+    return lo, hi
 
 
 def get_link(link: str) -> str | None:
@@ -571,53 +743,20 @@ def page(response: Any | Exception) -> Any:
         return e
 
 
-def loader(path: str | tuple) -> Any:
-    if isinstance(path, tuple):
-        path = path[0]
-    data = pd.read_excel(path, engine="openpyxl")
-    links = data.iloc[:, -1]
-    log.info("loader | rows=%s from %s", len(links), path)
-    return links
-
-
-def luncher(urls: str, thread_name: str, number: int) -> tuple:
-    response = get(urls)
-    info = page(response)
-    path, name = link_crawler(info, urls, thread_name, number)
-    return path, name
-
-
-def runner(url: str, thread_name: str, number: int) -> tuple:
-    path_thread, name = luncher(url, thread_name, number)
-    links = loader(path_thread)
-    return links, name
-
-
-def link_crawler(info: Any, url: str, thread_name: str, number: int) -> tuple:
-    dealer_list: list = []
-    failed: list = []
-    if isinstance(info, Exception):
-        log.error("link_crawler | bad listing info: %s", info)
-        raise info
+def discover_dealers_from_grid(
+    info: tuple,
+    url: str,
+    client: CargurusClient,
+) -> list[tuple[str, str, str]]:
+    dealer_list: list[tuple[str, str, str]] = []
     page_raw = info[1]
     if page_raw is None or (isinstance(page_raw, str) and not str(page_raw).strip()):
-        log.error("link_crawler | empty page count")
         raise ValueError("empty listing page info")
     page_clean = str(page_raw).replace(",", "")
     page_count = int(page_clean) // 10 + 1
     max_dealers = crawl_max_dealers()
     if max_dealers > 0:
         page_count = min(page_count, max(1, (max_dealers + 9) // 10))
-    name = info[0]
-    name = str(name).replace(",", "-").replace(" ", "").split()[0]
-    log.info(
-        "link_crawler | grid_pages=%s name=%s max_dealers=%s",
-        page_count,
-        name,
-        max_dealers or "unlimited",
-    )
-
-    client = _cc()
     grid_tmo = float(os.environ.get("CRAWL_GRID_TIMEOUT_SEC", "28"))
     for start in range(page_count):
         if max_dealers > 0 and len(dealer_list) >= max_dealers:
@@ -650,33 +789,15 @@ def link_crawler(info: Any, url: str, thread_name: str, number: int) -> tuple:
 
         inv_anchors = soup.find_all("a", attrs={"class": "viewInventory"})
         href_list = [a.get("href") for a in inv_anchors if a.get("href")]
-        for (inv_href, j, k) in zip(href_list, dealer_address, dealer_name):
+        for inv_href, addr, name_el in zip(href_list, dealer_address, dealer_name):
             if max_dealers > 0 and len(dealer_list) >= max_dealers:
                 break
-            j = " ".join(j.split())
-            dealer_list.append([k.strong.text, j, inv_href])
-        with open("failed.csv", "w", newline="") as f:
-            writer = csv.writer(f)
-            for item in failed:
-                writer.writerow([item])
+            list_name = name_el.strong.text if name_el.strong else name_el.get_text(strip=True)
+            dealer_list.append((list_name, " ".join(addr.split()), inv_href))
 
     if max_dealers > 0:
         dealer_list = dealer_list[:max_dealers]
-
-    df = pd.DataFrame(dealer_list)
-    if thread_name == "one":
-        thread_name = f"primary/{name}.xlsx"
-        writer = pd.ExcelWriter(thread_name, engine="xlsxwriter")
-        df.to_excel(writer, index=False)
-        writer.close()
-        log.info("link_crawler | wrote %s rows → %s", len(df), thread_name)
-        return thread_name, name
-    path = f"primary/{name}_{number}.xlsx"
-    writer = pd.ExcelWriter(path, engine="xlsxwriter")
-    df.to_excel(writer, index=False)
-    writer.close()
-    log.info("link_crawler | wrote %s rows → %s", len(df), path)
-    return path, name
+    return dealer_list
 
 
 def _extract_remix_route_loader(html: str) -> dict | None:
@@ -885,42 +1006,147 @@ def parser(html_doc: str | None) -> tuple:
     )
 
 
-def crawler(links: Any, name: str, thread_name: str, number: int) -> None:
-    rows: list = []
-    max_dealers = crawl_max_dealers()
-    link_list = list(links)
-    if max_dealers > 0:
-        link_list = link_list[:max_dealers]
-    total = len(link_list)
-    log.info("crawler | starting %s dealer pages for %s_%s", total, name, number)
-    for idx, link in enumerate(link_list):
+def process_state(state: str, worker_id: int) -> None:
+    """Discover dealers on a state grid and append each detail row to crawled/{state}.csv."""
+    tag = f"W{worker_id}"
+    seen = _init_state_csv(state)
+    max_per_state = _crawl_limit_int("CRAWL_MAX_DEALERS_PER_STATE", 0)
+    points = get_state_points(state)
+    max_cells = crawl_max_grid_cells()
+    if max_cells > 0:
+        points = points[:max_cells]
+
+    client = _cc()
+    dealers_written = 0
+    dmin, dmax = _delay_range()
+    grid_bar = tqdm(points, desc=f"{tag} {state}", unit="grid")
+
+    for latitude, longitude in grid_bar:
+        if max_per_state > 0 and dealers_written >= max_per_state:
+            break
+        base_url = (
+            f"{CARGURUS_ORIGIN}/Cars/dl.action?entityId=&address={state}"
+            f"&latitude={latitude}&longitude={longitude}&distance=100&page="
+        )
+        new_in_grid = 0
         try:
-            out_put = parser(get_link(link))
-            rows.append(out_put)
-        except Exception as e:
-            _stats["parse_exceptions"] += 1
-            log.exception("crawler | row %s failed: %s", idx, e)
-            time.sleep(3)
-        if (idx + 1) % 10 == 0:
-            log_stats_snapshot(f"dealer_progress {idx + 1}/{total}")
-    df = pd.DataFrame(
-        rows,
-        columns=[
-            "Name",
-            "Phone Number",
-            "Website",
-            "Number Of Cars",
-            "Score",
-            "Number Of Rates",
-            "Business Hours",
-        ],
+            response = get(base_url + "0")
+            info = page(response)
+            if isinstance(info, Exception):
+                raise info
+            dealers = discover_dealers_from_grid(info, base_url, client)
+        except Exception as exc:
+            _append_line(
+                "crawled/meta/error_grids.csv",
+                f"{state}|{latitude:.5f}|{longitude:.5f}|{type(exc).__name__}: {exc}",
+            )
+            log.warning(
+                "%s %s grid (%.4f, %.4f) failed: %s",
+                tag,
+                state,
+                latitude,
+                longitude,
+                exc,
+            )
+            time.sleep(random.uniform(dmin, dmax))
+            continue
+
+        for list_name, address, href in dealers:
+            if max_per_state > 0 and dealers_written >= max_per_state:
+                break
+            page_url = _dealer_page_url(href)
+            if page_url in seen:
+                continue
+            seen.add(page_url)
+            try:
+                parsed = parser(get_link(href))
+            except Exception as exc:
+                _stats["parse_exceptions"] += 1
+                log.exception("%s dealer failed %s: %s", tag, page_url, exc)
+                time.sleep(3)
+                continue
+            row = _format_result_row(list_name, address, href, parsed, state)
+            _append_line(f"crawled/{state}.csv", row)
+            dealers_written += 1
+            new_in_grid += 1
+            print(f"[{tag} {state}] {parsed[0]}")
+            time.sleep(random.uniform(dmin, dmax))
+
+        grid_bar.set_postfix(dealers=dealers_written, new=new_in_grid, refresh=False)
+        if dealers_written and dealers_written % 25 == 0:
+            log_stats_snapshot(f"{tag}_{state}_{dealers_written}")
+
+    log.info("%s finished %s | dealers_written=%s", tag, state, dealers_written)
+    log_stats_snapshot(f"finished_{state}")
+
+
+def worker_entry(worker_id: int, task_queue: queue.Queue) -> None:
+    tag = f"[W{worker_id}]"
+    try:
+        while True:
+            item = task_queue.get()
+            if item is _WORKER_QUEUE_SENTINEL:
+                break
+            state = str(item)
+            print(f"{tag} Starting {state}")
+            try:
+                process_state(state, worker_id)
+            except Exception as exc:
+                log.exception("%s failed on %s: %s", tag, state, exc)
+                _append_line(
+                    "crawled/meta/error_states.csv",
+                    f"{state}|{type(exc).__name__}: {exc}",
+                )
+            print(f"{tag} Completed {state}")
+    finally:
+        print(f"{tag} exiting")
+
+
+def main() -> None:
+    os.makedirs("crawled/meta", exist_ok=True)
+    os.makedirs("logs", exist_ok=True)
+
+    states = _configured_states()
+    if not states:
+        log.error("No states configured (set CRAWL_STATES or use DEFAULT_STATES)")
+        sys.exit(1)
+
+    n = _num_workers()
+    print(
+        f"[cargurus] {len(states)} state(s), {n} worker thread(s) → crawled/<State>.csv"
     )
-    out_path = f"primary_result/{name}_{number}.xlsx"
-    writer = pd.ExcelWriter(out_path, engine="xlsxwriter")
-    df.to_excel(writer)
-    writer.close()
-    log.info("crawler | wrote %s rows → %s", len(df), out_path)
-    log_stats_snapshot(f"finished_grid_{name}_{number}")
+    log.info(
+        "Starting crawl | workers=%s | states=%s | grid_cells=%s | dealers_per_state=%s",
+        n,
+        len(states),
+        crawl_max_grid_cells() or "all",
+        _crawl_limit_int("CRAWL_MAX_DEALERS_PER_STATE", 0) or "unlimited",
+    )
+
+    task_queue: queue.Queue = queue.Queue()
+    for state in states:
+        task_queue.put(state)
+    for _ in range(n):
+        task_queue.put(_WORKER_QUEUE_SENTINEL)
+
+    stagger = float(os.environ.get("CRAWL_STAGGER_SEC", "3"))
+    threads = [
+        threading.Thread(
+            target=worker_entry,
+            args=(wid, task_queue),
+            name=f"cargurus-worker-{wid}",
+            daemon=False,
+        )
+        for wid in range(n)
+    ]
+    for t in threads:
+        t.start()
+        time.sleep(random.uniform(0.5, max(stagger, 0.5)))
+    for t in threads:
+        t.join()
+
+    print("[cargurus] All workers finished.")
+    log_stats_snapshot("final")
 
 
 def get_state_points(state_name: str) -> list[tuple[float, float]]:
@@ -962,68 +1188,4 @@ def get_state_points(state_name: str) -> list[tuple[float, float]]:
 
 
 if __name__ == "__main__":
-    os.makedirs("primary", exist_ok=True)
-    os.makedirs("primary_result", exist_ok=True)
-    os.makedirs("logs", exist_ok=True)
-
-    log.info("Starting crawl | LOG_LEVEL=%s | SHAPEFILE_PATH=%s", LOG_LEVEL, SHAPEFILE_PATH)
-    log.info(
-        "HTTP tuning | CRAWL_USE_CURL_CFFI=%s delays=%s-%ss retries=%s",
-        os.environ.get("CRAWL_USE_CURL_CFFI", "1"),
-        os.environ.get("CRAWL_MIN_DELAY_SEC", "0.55"),
-        os.environ.get("CRAWL_MAX_DELAY_SEC", "2.4"),
-        os.environ.get("CRAWL_HTTP_RETRIES", "6"),
-    )
-    client = _cc()
-    if not client.warmup():
-        log.error(
-            "Aborting: CarGurus warmup failed. Run: python check_cargurus_access.py  "
-            "On GCP: pip install -r requirements.txt"
-        )
-        sys.exit(1)
-
-    states_raw = os.environ.get("CRAWL_STATES", "Oregon")
-    state_names = [s.strip() for s in states_raw.split(",") if s.strip()]
-    if not state_names:
-        log.error("CRAWL_STATES is empty")
-        sys.exit(1)
-    max_states = crawl_max_states()
-    if max_states > 0:
-        state_names = state_names[:max_states]
-    max_cells = crawl_max_grid_cells()
-    log.info(
-        "Crawl limits | states=%s (max %s) | grid_cells_per_state=%s | max_dealers=%s",
-        state_names,
-        max_states or "all",
-        max_cells or "all",
-        crawl_max_dealers() or "unlimited",
-    )
-    for state_name in state_names:
-        log.info("=== State: %s ===", state_name)
-        points = get_state_points(state_name)
-        if max_cells > 0:
-            points = points[:max_cells]
-        for number, (latitude, longitude) in enumerate(points):
-            log.info(
-                "--- Grid cell %s/%s | lat=%.5f lon=%.5f ---",
-                number + 1,
-                len(points),
-                latitude,
-                longitude,
-            )
-            url = (
-                f"https://www.cargurus.com/Cars/dl.action?entityId=&address={state_name}"
-                f"&latitude={latitude}&longitude={longitude}&distance=100"
-            )
-            url += "&page="
-            try:
-                links, name = runner(url, "ali", number)
-                crawler(links, name, "ali", number)
-            except Exception as e:
-                log.exception("Fatal step for grid %s: %s", number, e)
-                
-                log_stats_snapshot(f"error_grid_{number}")
-            log_stats_snapshot(f"after_grid_{number}")
-
-    log.info("All configured states finished.")
-    log_stats_snapshot("final")
+    main()
