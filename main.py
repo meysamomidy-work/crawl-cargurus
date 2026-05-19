@@ -1,3 +1,4 @@
+import argparse
 import json
 import logging
 import os
@@ -85,7 +86,9 @@ def default_warmup_listing_url() -> str:
     override = os.environ.get("CRAWL_WARMUP_LISTING_URL", "").strip()
     if override:
         return override
-    state = (os.environ.get("CRAWL_STATES", "Oregon").split(",")[0] or "Oregon").strip()
+    # First state assigned to this terminal (set in main when using --worker/--workers).
+    state_src = os.environ.get("CRAWL_TERMINAL_STATES", "") or os.environ.get("CRAWL_STATES", "Oregon")
+    state = (state_src.split(",")[0] or "Oregon").strip()
     lat = os.environ.get("CRAWL_WARMUP_LAT", "44.0")
     lon = os.environ.get("CRAWL_WARMUP_LON", "-120.5")
     return (
@@ -663,6 +666,80 @@ def _configured_states() -> list[str]:
     return names
 
 
+def _parse_terminal_worker_cli(argv: list[str] | None = None) -> tuple[int, int]:
+    """
+    Terminal/process sharding for multi-window runs (not the in-process thread pool).
+
+    Returns (worker_index 0-based, worker_count).
+    CLI: --worker 1 --workers 4  (first of four terminals)
+    Env: CRAWL_TERMINAL_WORKER, CRAWL_TERMINAL_WORKERS (same 1-based worker id)
+    """
+    parser = argparse.ArgumentParser(
+        description="CarGurus dealer crawler",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "-w",
+        "--worker",
+        type=int,
+        default=None,
+        help="This terminal's index (1 .. --workers). Divides states across processes.",
+    )
+    parser.add_argument(
+        "-W",
+        "--workers",
+        type=int,
+        default=None,
+        help="How many terminals/processes are running the crawl in parallel.",
+    )
+    args = parser.parse_args(argv)
+
+    env_worker = os.environ.get("CRAWL_TERMINAL_WORKER", "").strip()
+    env_workers = os.environ.get("CRAWL_TERMINAL_WORKERS", "").strip()
+    worker_1based = args.worker
+    if worker_1based is None and env_worker:
+        worker_1based = int(env_worker)
+    workers = args.workers
+    if workers is None and env_workers:
+        workers = int(env_workers)
+
+    if worker_1based is None:
+        worker_1based = 1
+    if workers is None:
+        workers = 1
+
+    if workers < 1:
+        parser.error("--workers must be >= 1")
+    if worker_1based < 1 or worker_1based > workers:
+        parser.error(f"--worker must be between 1 and {workers} (got {worker_1based})")
+
+    return worker_1based - 1, workers
+
+
+def _states_for_terminal(
+    all_states: list[str], worker_index: int, worker_count: int
+) -> list[str]:
+    """Round-robin split so each terminal gets a fair share of states."""
+    if worker_count <= 1:
+        return list(all_states)
+    return [s for i, s in enumerate(all_states) if i % worker_count == worker_index]
+
+
+def _add_terminal_log_handler(worker_index: int, worker_count: int) -> None:
+    if worker_count <= 1:
+        return
+    path = os.path.join(
+        _log_dir, f"crawl-terminal-{worker_index + 1}-of-{worker_count}.log"
+    )
+    for h in _root.handlers:
+        if getattr(h, "baseFilename", None) == os.path.abspath(path):
+            return
+    fh = logging.FileHandler(path, encoding="utf-8")
+    fh.setFormatter(_fmt)
+    _root.addHandler(fh)
+    log.info("Terminal log file: %s", path)
+
+
 def _delay_range() -> tuple[float, float]:
     lo = float(os.environ.get("CRAWL_MIN_DELAY_SEC", "0.55"))
     hi = float(os.environ.get("CRAWL_MAX_DELAY_SEC", "2.4"))
@@ -1191,14 +1268,45 @@ def worker_entry(worker_id: int, task_queue: queue.Queue, progress: tqdm) -> Non
         print(f"{tag} exiting")
 
 
-def main() -> None:
+def main(
+    *,
+    terminal_index: int = 0,
+    terminal_count: int = 1,
+) -> None:
     os.makedirs("crawled/meta", exist_ok=True)
     os.makedirs("logs", exist_ok=True)
+    _add_terminal_log_handler(terminal_index, terminal_count)
 
-    states = _configured_states()
-    if not states:
+    all_states = _configured_states()
+    if not all_states:
         log.error("No states configured (set CRAWL_STATES or use DEFAULT_STATES)")
         sys.exit(1)
+
+    states = _states_for_terminal(all_states, terminal_index, terminal_count)
+    if not states:
+        print(
+            f"[cargurus] Terminal {terminal_index + 1}/{terminal_count}: "
+            f"no states assigned (only {len(all_states)} state(s) in config). Exiting."
+        )
+        return
+
+    os.environ["CRAWL_TERMINAL_STATES"] = ",".join(states)
+    term_label = (
+        f"terminal {terminal_index + 1}/{terminal_count}"
+        if terminal_count > 1
+        else "single terminal"
+    )
+    print(
+        f"[cargurus] {term_label} | {len(states)} state(s): "
+        + ", ".join(states[:12])
+        + (" …" if len(states) > 12 else "")
+    )
+    log.info(
+        "Terminal partition | %s | assigned=%s | all_configured=%s",
+        term_label,
+        states,
+        len(all_states),
+    )
 
     n = _num_workers()
     detail_n = _detail_workers()
@@ -1210,10 +1318,14 @@ def main() -> None:
 
     print(
         f"[cargurus] {len(states)} state(s) | {len(grid_tasks)} grid task(s) | "
-        f"{n} worker thread(s) | {detail_n} detail fetch(es) per grid | → crawled/<State>.csv"
+        f"{n} in-process thread(s) (CRAWL_NUM_WORKERS) | "
+        f"{detail_n} detail fetch(es) per grid | → crawled/<State>.csv"
     )
     log.info(
-        "Starting crawl | workers=%s | detail_workers=%s | states=%s | grids=%s",
+        "Starting crawl | terminal=%s/%s | threads=%s | detail_workers=%s | "
+        "states=%s | grids=%s",
+        terminal_index + 1,
+        terminal_count,
         n,
         detail_n,
         len(states),
@@ -1287,4 +1399,5 @@ def get_state_points(state_name: str) -> list[tuple[float, float]]:
 
 
 if __name__ == "__main__":
-    main()
+    t_index, t_count = _parse_terminal_worker_cli()
+    main(terminal_index=t_index, terminal_count=t_count)
