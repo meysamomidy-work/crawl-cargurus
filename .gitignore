@@ -202,6 +202,7 @@ cython_debug/
 # .vscode/
 # Crawl output (like cars crowler)
 crawled/
+excels/
 logs/
 file_path.txt
 primary/
@@ -224,3 +225,4 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
