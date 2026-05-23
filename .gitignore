@@ -208,6 +208,7 @@ file_path.txt
 primary/
 primary_result/
 failed.csv
+*.ipynb
 
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
